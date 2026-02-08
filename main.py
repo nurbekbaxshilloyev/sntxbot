@@ -1,263 +1,303 @@
 import os
 import sqlite3
-from dotenv import load_dotenv
 from telegram import (
     Update,
     InlineKeyboardButton,
-    InlineKeyboardMarkup,
-    KeyboardButton,
-    ReplyKeyboardMarkup
+    InlineKeyboardMarkup
 )
 from telegram.ext import (
     ApplicationBuilder,
     CommandHandler,
-    MessageHandler,
     CallbackQueryHandler,
+    MessageHandler,
     ContextTypes,
     filters
 )
 
-# ---------- ENV ----------
-load_dotenv()
-TOKEN = os.getenv("BOT_TOKEN")
+# ================== ENV ==================
+BOT_TOKEN = os.getenv("BOT_TOKEN")
 ADMIN_ID = int(os.getenv("ADMIN_ID"))
-ADMIN_PHONE = os.getenv("ADMIN_PHONE")
 
-# ---------- DB ----------
-# Use writable directory for database (configurable via DATABASE_PATH env var)
-# In production, this should point to a persistent volume, not read-only /nix/store
-db_path = os.getenv("DATABASE_PATH", "/tmp/telegram_bot_database.db")
+# ================== DB ==================
+conn = sqlite3.connect("shop.db", check_same_thread=False)
+cursor = conn.cursor()
 
-# Ensure directory exists and is writable
-db_dir = os.path.dirname(db_path) if os.path.dirname(db_path) else "/tmp"
-
-try:
-    os.makedirs(db_dir, exist_ok=True)
-    conn = sqlite3.connect(db_path, check_same_thread=False)
-    cur = conn.cursor()
-except (OSError, sqlite3.OperationalError) as e:
-    # Fallback to /tmp if configured path is not writable
-    print(f"Warning: Could not use {db_path}: {e}")
-    db_path = "/tmp/telegram_bot_database.db"
-    os.makedirs("/tmp", exist_ok=True)
-    conn = sqlite3.connect(db_path, check_same_thread=False)
-    cur = conn.cursor()
-
-cur.execute("""
-CREATE TABLE IF NOT EXISTS users(
-    id INTEGER PRIMARY KEY,
-    name TEXT,
-    phone TEXT
+cursor.execute("""
+CREATE TABLE IF NOT EXISTS users (
+    user_id INTEGER PRIMARY KEY
 )
 """)
 
-cur.execute("""
-CREATE TABLE IF NOT EXISTS products(
+cursor.execute("""
+CREATE TABLE IF NOT EXISTS products (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     name TEXT,
-    price INTEGER,
-    image TEXT
+    price INTEGER
 )
 """)
 
-cur.execute("""
-CREATE TABLE IF NOT EXISTS cart(
+cursor.execute("""
+CREATE TABLE IF NOT EXISTS cart (
     user_id INTEGER,
-    product_id INTEGER
+    product_id INTEGER,
+    qty INTEGER
 )
 """)
 
-cur.execute("""
-CREATE TABLE IF NOT EXISTS orders(
+cursor.execute("""
+CREATE TABLE IF NOT EXISTS orders (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     user_id INTEGER,
-    items TEXT
+    total INTEGER
 )
 """)
+
 conn.commit()
 
-# ---------- START ----------
+# ================== START ==================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    uid = update.effective_user.id
+    user_id = update.effective_user.id
+    cursor.execute("INSERT OR IGNORE INTO users VALUES (?)", (user_id,))
+    conn.commit()
 
-    if uid == ADMIN_ID:
-        kb = InlineKeyboardMarkup([
+    if user_id == ADMIN_ID:
+        keyboard = [
             [InlineKeyboardButton("➕ Mahsulot qo‘shish", callback_data="add_product")],
-            [InlineKeyboardButton("📦 Mahsulotlarni boshqarish", callback_data="edit_products")],
+            [InlineKeyboardButton("📦 Mahsulotlar", callback_data="admin_products")],
             [InlineKeyboardButton("📢 Broadcast", callback_data="broadcast")],
             [InlineKeyboardButton("📊 Buyurtma statistikasi", callback_data="stats")]
-        ])
-        await update.message.reply_text("👑 ADMIN PANEL", reply_markup=kb)
-        return
-
-    cur.execute("SELECT * FROM users WHERE id=?", (uid,))
-    if not cur.fetchone():
-        context.user_data["register"] = "name"
-        await update.message.reply_text("👤 Ismingizni kiriting:")
-        return
-
-    await show_products(update)
-
-# ---------- USER REGISTER ----------
-async def register(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    step = context.user_data.get("register")
-
-    if step == "name":
-        context.user_data["name"] = update.message.text
-        context.user_data["register"] = "phone"
-        kb = ReplyKeyboardMarkup(
-            [[KeyboardButton("📞 Raqam yuborish", request_contact=True)]],
-            resize_keyboard=True
+        ]
+        await update.message.reply_text(
+            "🛠 Admin panel",
+            reply_markup=InlineKeyboardMarkup(keyboard)
         )
-        await update.message.reply_text("📱 Telefon raqamingiz:", reply_markup=kb)
-
-    elif step == "phone":
-        phone = update.message.contact.phone_number
-        cur.execute(
-            "INSERT INTO users VALUES (?,?,?)",
-            (update.effective_user.id, context.user_data["name"], phone)
+    else:
+        keyboard = [
+            [InlineKeyboardButton("🛍 Mahsulotlar", callback_data="view_products")],
+            [InlineKeyboardButton("🛒 Savatcha", callback_data="view_cart")]
+        ]
+        await update.message.reply_text(
+            "Xush kelibsiz 👋",
+            reply_markup=InlineKeyboardMarkup(keyboard)
         )
-        conn.commit()
-        context.user_data.clear()
-        await update.message.reply_text("✅ Ro‘yxatdan o‘tdingiz")
-        await show_products(update)
 
-# ---------- SHOW PRODUCTS ----------
-async def show_products(update: Update):
-    cur.execute("SELECT * FROM products")
-    products = cur.fetchall()
+# ================== ADMIN ADD PRODUCT ==================
+async def add_product_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.callback_query.answer()
+    context.user_data["state"] = "ADD_NAME"
+    await update.callback_query.message.reply_text("📦 Mahsulot nomini kiriting:")
 
-    if not products:
-        await update.message.reply_text("📦 Mahsulotlar yo‘q")
-        return
+# ================== BROADCAST ==================
+async def broadcast_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.callback_query.answer()
+    context.user_data["state"] = "BROADCAST"
+    await update.callback_query.message.reply_text("📢 Matnni kiriting:")
 
+# ================== ADMIN PRODUCTS ==================
+async def admin_products(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.callback_query.answer()
+
+    cursor.execute("SELECT * FROM products")
+    products = cursor.fetchall()
+
+    keyboard = []
     for p in products:
-        kb = InlineKeyboardMarkup([
-            [InlineKeyboardButton("🛒 Savatchaga qo‘shish", callback_data=f"addcart_{p[0]}")]
+        keyboard.append([
+            InlineKeyboardButton(
+                f"{p[1]} - {p[2]} so‘m",
+                callback_data=f"edit_{p[0]}"
+            )
         ])
-        await update.message.reply_photo(
-            photo=p[3],
-            caption=f"📦 {p[1]}\n💰 {p[2]} so‘m\n📞 {ADMIN_PHONE}",
-            reply_markup=kb
+
+    await update.callback_query.message.reply_text(
+        "📦 Mahsulotlar:",
+        reply_markup=InlineKeyboardMarkup(keyboard)
+    )
+
+# ================== EDIT PRODUCT ==================
+async def edit_product(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    pid = int(query.data.split("_")[1])
+    context.user_data["edit_pid"] = pid
+    context.user_data["state"] = "EDIT_NAME"
+
+    await query.message.reply_text("✏️ Yangi nomini kiriting:")
+
+# ================== USER PRODUCTS ==================
+async def view_products(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.callback_query.answer()
+
+    cursor.execute("SELECT * FROM products")
+    products = cursor.fetchall()
+
+    keyboard = []
+    for p in products:
+        keyboard.append([
+            InlineKeyboardButton(
+                f"{p[1]} ({p[2]} so‘m)",
+                callback_data=f"addcart_{p[0]}"
+            )
+        ])
+
+    await update.callback_query.message.reply_text(
+        "🛍 Mahsulotlar:",
+        reply_markup=InlineKeyboardMarkup(keyboard)
+    )
+
+# ================== ADD TO CART ==================
+async def add_to_cart(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    pid = int(query.data.split("_")[1])
+    uid = query.from_user.id
+
+    cursor.execute(
+        "SELECT qty FROM cart WHERE user_id=? AND product_id=?",
+        (uid, pid)
+    )
+    row = cursor.fetchone()
+
+    if row:
+        cursor.execute(
+            "UPDATE cart SET qty=qty+1 WHERE user_id=? AND product_id=?",
+            (uid, pid)
         )
+    else:
+        cursor.execute(
+            "INSERT INTO cart VALUES (?, ?, 1)",
+            (uid, pid)
+        )
+    conn.commit()
 
-# ---------- CALLBACK ----------
-async def callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    await q.answer()
-    data = q.data
+    await query.message.reply_text("✅ Savatchaga qo‘shildi")
 
-    # ADD TO CART
-    if data.startswith("addcart_"):
-        pid = int(data.split("_")[1])
-        cur.execute("INSERT INTO cart VALUES (?,?)", (q.from_user.id, pid))
-        conn.commit()
-        await q.message.reply_text("✅ Savatchaga qo‘shildi")
-
-    # ADMIN ADD PRODUCT
-    elif data == "add_product":
-        context.user_data["add"] = "name"
-        await q.message.reply_text("📦 Mahsulot nomi:")
-
-    elif data == "edit_products":
-        cur.execute("SELECT * FROM products")
-        for p in cur.fetchall():
-            kb = InlineKeyboardMarkup([
-                [
-                    InlineKeyboardButton("✏️ Tahrirlash", callback_data=f"edit_{p[0]}"),
-                    InlineKeyboardButton("❌ O‘chirish", callback_data=f"del_{p[0]}")
-                ]
-            ])
-            await q.message.reply_text(f"{p[1]} — {p[2]} so‘m", reply_markup=kb)
-
-    elif data.startswith("del_"):
-        pid = int(data.split("_")[1])
-        cur.execute("DELETE FROM products WHERE id=?", (pid,))
-        conn.commit()
-        await q.message.reply_text("❌ O‘chirildi")
-
-    elif data.startswith("edit_"):
-        context.user_data["edit_id"] = int(data.split("_")[1])
-        kb = InlineKeyboardMarkup([
-            [InlineKeyboardButton("✏️ Nomi", callback_data="ename")],
-            [InlineKeyboardButton("💰 Narx", callback_data="eprice")],
-            [InlineKeyboardButton("🖼 Rasm", callback_data="eimage")]
-        ])
-        await q.message.reply_text("Nimani tahrirlaysiz?", reply_markup=kb)
-
-    elif data in ["ename", "eprice", "eimage"]:
-        context.user_data["edit_field"] = data
-        await q.message.reply_text("✍️ Yangi qiymat yuboring")
-
-    elif data == "broadcast":
-        context.user_data["broadcast"] = True
-        await q.message.reply_text("📢 Xabar matnini yuboring")
-
-    elif data == "stats":
-        cur.execute("SELECT COUNT(*) FROM orders")
-        await q.message.reply_text(f"📊 Buyurtmalar soni: {cur.fetchone()[0]}")
-
-# ---------- ADMIN TEXT ----------
-async def admin_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+# ================== VIEW CART ==================
+async def view_cart(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.callback_query.answer()
     uid = update.effective_user.id
-    if uid != ADMIN_ID:
+
+    cursor.execute("""
+    SELECT p.name, p.price, c.qty
+    FROM cart c
+    JOIN products p ON p.id=c.product_id
+    WHERE c.user_id=?
+    """, (uid,))
+    rows = cursor.fetchall()
+
+    if not rows:
+        await update.callback_query.message.reply_text("🛒 Savatcha bo‘sh")
         return
 
-    # ADD PRODUCT FLOW
-    if context.user_data.get("add") == "name":
-        context.user_data["pname"] = update.message.text
-        context.user_data["add"] = "price"
-        await update.message.reply_text("💰 Narxi:")
+    total = 0
+    text = "🛒 Savatcha:\n"
+    for r in rows:
+        total += r[1] * r[2]
+        text += f"{r[0]} x{r[2]} = {r[1]*r[2]}\n"
 
-    elif context.user_data.get("add") == "price":
-        context.user_data["price"] = int(update.message.text)
-        context.user_data["add"] = "image"
-        await update.message.reply_text("🖼 Rasm URL:")
+    text += f"\n💰 Jami: {total}"
 
-    elif context.user_data.get("add") == "image":
-        cur.execute(
-            "INSERT INTO products(name,price,image) VALUES (?,?,?)",
-            (context.user_data["pname"], context.user_data["price"], update.message.text)
+    keyboard = [
+        [InlineKeyboardButton("✅ Buyurtmani tasdiqlash", callback_data="confirm_order")]
+    ]
+
+    await update.callback_query.message.reply_text(
+        text,
+        reply_markup=InlineKeyboardMarkup(keyboard)
+    )
+
+# ================== CONFIRM ORDER ==================
+async def confirm_order(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    uid = query.from_user.id
+
+    cursor.execute("""
+    SELECT p.price, c.qty
+    FROM cart c JOIN products p ON p.id=c.product_id
+    WHERE c.user_id=?
+    """, (uid,))
+    rows = cursor.fetchall()
+
+    total = sum(p*q for p, q in rows)
+
+    cursor.execute("INSERT INTO orders (user_id, total) VALUES (?, ?)", (uid, total))
+    cursor.execute("DELETE FROM cart WHERE user_id=?", (uid,))
+    conn.commit()
+
+    await query.message.reply_text("🎉 Buyurtma qabul qilindi!")
+
+# ================== ADMIN TEXT HANDLER ==================
+async def admin_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != ADMIN_ID:
+        return
+
+    state = context.user_data.get("state")
+
+    if state == "ADD_NAME":
+        context.user_data["name"] = update.message.text
+        context.user_data["state"] = "ADD_PRICE"
+        await update.message.reply_text("💰 Narxini kiriting:")
+        return
+
+    if state == "ADD_PRICE":
+        cursor.execute(
+            "INSERT INTO products (name, price) VALUES (?, ?)",
+            (context.user_data["name"], int(update.message.text))
         )
         conn.commit()
         context.user_data.clear()
         await update.message.reply_text("✅ Mahsulot qo‘shildi")
+        return
 
-    # EDIT PRODUCT
-    elif "edit_id" in context.user_data:
-        pid = context.user_data["edit_id"]
-        field = context.user_data["edit_field"]
+    if state == "EDIT_NAME":
+        context.user_data["new_name"] = update.message.text
+        context.user_data["state"] = "EDIT_PRICE"
+        await update.message.reply_text("💰 Yangi narx:")
+        return
 
-        if field == "ename":
-            cur.execute("UPDATE products SET name=? WHERE id=?", (update.message.text, pid))
-        elif field == "eprice":
-            cur.execute("UPDATE products SET price=? WHERE id=?", (int(update.message.text), pid))
-        elif field == "eimage":
-            cur.execute("UPDATE products SET image=? WHERE id=?", (update.message.text, pid))
-
+    if state == "EDIT_PRICE":
+        cursor.execute(
+            "UPDATE products SET name=?, price=? WHERE id=?",
+            (
+                context.user_data["new_name"],
+                int(update.message.text),
+                context.user_data["edit_pid"]
+            )
+        )
         conn.commit()
         context.user_data.clear()
-        await update.message.reply_text("✅ Yangilandi")
+        await update.message.reply_text("✏️ Tahrirlandi")
+        return
 
-    # BROADCAST
-    elif context.user_data.get("broadcast"):
-        cur.execute("SELECT id FROM users")
-        for u in cur.fetchall():
+    if state == "BROADCAST":
+        cursor.execute("SELECT user_id FROM users")
+        for (uid,) in cursor.fetchall():
             try:
-                await update.get_bot().send_message(u[0], update.message.text)
+                await context.bot.send_message(uid, update.message.text)
             except:
                 pass
         context.user_data.clear()
         await update.message.reply_text("📢 Yuborildi")
 
-# ---------- MAIN ----------
+# ================== MAIN ==================
 def main():
-    app = ApplicationBuilder().token(TOKEN).build()
+    app = ApplicationBuilder().token(BOT_TOKEN).build()
 
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(CallbackQueryHandler(callbacks))
-    app.add_handler(MessageHandler(filters.CONTACT, register))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, register))
+
+    app.add_handler(CallbackQueryHandler(add_product_cb, pattern="add_product"))
+    app.add_handler(CallbackQueryHandler(admin_products, pattern="admin_products"))
+    app.add_handler(CallbackQueryHandler(edit_product, pattern="edit_"))
+    app.add_handler(CallbackQueryHandler(broadcast_cb, pattern="broadcast"))
+
+    app.add_handler(CallbackQueryHandler(view_products, pattern="view_products"))
+    app.add_handler(CallbackQueryHandler(add_to_cart, pattern="addcart_"))
+    app.add_handler(CallbackQueryHandler(view_cart, pattern="view_cart"))
+    app.add_handler(CallbackQueryHandler(confirm_order, pattern="confirm_order"))
+
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, admin_text))
 
     app.run_polling()
