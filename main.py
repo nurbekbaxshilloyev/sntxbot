@@ -30,14 +30,16 @@ db_path = os.getenv("DATABASE_PATH", "/tmp/telegram_bot_database.db")
 
 # Ensure directory exists and is writable
 db_dir = os.path.dirname(db_path) if os.path.dirname(db_path) else "/tmp"
-os.makedirs(db_dir, exist_ok=True)
 
 try:
+    os.makedirs(db_dir, exist_ok=True)
     conn = sqlite3.connect(db_path, check_same_thread=False)
     cur = conn.cursor()
-except sqlite3.OperationalError as e:
+except (OSError, sqlite3.OperationalError) as e:
     # Fallback to /tmp if configured path is not writable
+    print(f"Warning: Could not use {db_path}: {e}")
     db_path = "/tmp/telegram_bot_database.db"
+    os.makedirs("/tmp", exist_ok=True)
     conn = sqlite3.connect(db_path, check_same_thread=False)
     cur = conn.cursor()
 
