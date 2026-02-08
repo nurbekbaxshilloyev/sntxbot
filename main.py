@@ -3,7 +3,8 @@ import sqlite3
 from telegram import (
     Update,
     InlineKeyboardButton,
-    InlineKeyboardMarkup
+    InlineKeyboardMarkup,
+    InputMediaPhoto
 )
 from telegram.ext import (
     ApplicationBuilder,
@@ -42,7 +43,8 @@ cursor.execute("""
 CREATE TABLE IF NOT EXISTS products (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     name TEXT,
-    price INTEGER
+    price INTEGER,
+    image TEXT
 )
 """)
 
@@ -97,32 +99,64 @@ async def add_product_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["state"] = "ADD_NAME"
     await update.callback_query.message.reply_text("📦 Mahsulot nomini kiriting:")
 
+# ================== ADD PRODUCT IMAGE HANDLER ==================
+async def handle_product_image(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != ADMIN_ID:
+        return
+    
+    state = context.user_data.get("state")
+    if state != "ADD_IMAGE":
+        return
+    
+    if update.message.photo:
+        file_id = update.message.photo[-1].file_id
+        context.user_data["image"] = file_id
+        context.user_data["state"] = "ADD_IMAGE_CONFIRM"
+        await update.message.reply_text("✅ Rasm qabul qilindi. Mahsulot qo'shildi!")
+        
+        cursor.execute(
+            "INSERT INTO products (name, price, image) VALUES (?, ?, ?)",
+            (context.user_data["name"], context.user_data["price"], file_id)
+        )
+        conn.commit()
+        context.user_data.clear()
+    else:
+        await update.message.reply_text("📸 Iltimos, rasm yuboring:")
+
 # ================== BROADCAST ==================
 async def broadcast_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.callback_query.answer()
     context.user_data["state"] = "BROADCAST"
     await update.callback_query.message.reply_text("📢 Matnni kiriting:")
 
-# ================== ADMIN PRODUCTS ==================
 async def admin_products(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.callback_query.answer()
 
     cursor.execute("SELECT * FROM products")
     products = cursor.fetchall()
 
-    keyboard = []
     for p in products:
-        keyboard.append([
-            InlineKeyboardButton(
-                f"{p[1]} - {p[2]} so‘m",
-                callback_data=f"edit_{p[0]}"
+        text = f"<b>{p[1]}</b>\n💰 {p[2]} so'm"
+        keyboard = [
+            [
+                InlineKeyboardButton(f"✏️ O'zgartirish", callback_data=f"edit_{p[0]}"),
+                InlineKeyboardButton(f"🗑️ O'chirish", callback_data=f"delete_{p[0]}")
+            ]
+        ]
+        
+        if p[3]:  # If image exists
+            await update.callback_query.message.reply_photo(
+                photo=p[3],
+                caption=text,
+                parse_mode="HTML",
+                reply_markup=InlineKeyboardMarkup(keyboard)
             )
-        ])
-
-    await update.callback_query.message.reply_text(
-        "📦 Mahsulotlar:",
-        reply_markup=InlineKeyboardMarkup(keyboard)
-    )
+        else:
+            await update.callback_query.message.reply_text(
+                text,
+                parse_mode="HTML",
+                reply_markup=InlineKeyboardMarkup(keyboard)
+            )
 
 # ================== EDIT PRODUCT ==================
 async def edit_product(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -135,26 +169,44 @@ async def edit_product(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await query.message.reply_text("✏️ Yangi nomini kiriting:")
 
-# ================== USER PRODUCTS ==================
+# ================== DELETE PRODUCT ==================
+async def delete_product(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    pid = int(query.data.split("_")[1])
+    
+    cursor.execute("DELETE FROM products WHERE id=?", (pid,))
+    cursor.execute("DELETE FROM cart WHERE product_id=?", (pid,))
+    conn.commit()
+    
+    await query.message.reply_text("🗑️ Mahsulot o'chirildi")
+
 async def view_products(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.callback_query.answer()
 
     cursor.execute("SELECT * FROM products")
     products = cursor.fetchall()
 
-    keyboard = []
     for p in products:
-        keyboard.append([
-            InlineKeyboardButton(
-                f"{p[1]} ({p[2]} so‘m)",
-                callback_data=f"addcart_{p[0]}"
+        text = f"<b>{p[1]}</b>\n💰 Narx: {p[2]} so'm"
+        keyboard = [
+            [InlineKeyboardButton(f"🛒 Savatchaga qo'shish", callback_data=f"addcart_{p[0]}")]
+        ]
+        
+        if p[3]:  # If image exists
+            await update.callback_query.message.reply_photo(
+                photo=p[3],
+                caption=text,
+                parse_mode="HTML",
+                reply_markup=InlineKeyboardMarkup(keyboard)
             )
-        ])
-
-    await update.callback_query.message.reply_text(
-        "🛍 Mahsulotlar:",
-        reply_markup=InlineKeyboardMarkup(keyboard)
-    )
+        else:
+            await update.callback_query.message.reply_text(
+                text,
+                parse_mode="HTML",
+                reply_markup=InlineKeyboardMarkup(keyboard)
+            )
 
 # ================== ADD TO CART ==================
 async def add_to_cart(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -253,13 +305,22 @@ async def admin_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if state == "ADD_PRICE":
-        cursor.execute(
-            "INSERT INTO products (name, price) VALUES (?, ?)",
-            (context.user_data["name"], int(update.message.text))
-        )
-        conn.commit()
-        context.user_data.clear()
-        await update.message.reply_text("✅ Mahsulot qo‘shildi")
+        context.user_data["price"] = int(update.message.text)
+        context.user_data["state"] = "ADD_IMAGE"
+        await update.message.reply_text("📸 Mahsulot rasmini yuboring (yoki /skip ni yuboring rasm siz qo'shish uchun):")
+        return
+
+    if state == "ADD_IMAGE":
+        if update.message.text == "/skip":
+            cursor.execute(
+                "INSERT INTO products (name, price, image) VALUES (?, ?, ?)",
+                (context.user_data["name"], context.user_data["price"], None)
+            )
+            conn.commit()
+            context.user_data.clear()
+            await update.message.reply_text("✅ Mahsulot qo'shildi (rasmsiz)")
+        else:
+            await update.message.reply_text("📸 Iltimos, rasm yuboring yoki /skip ni yuboring:")
         return
 
     if state == "EDIT_NAME":
@@ -301,6 +362,7 @@ def main():
     app.add_handler(CallbackQueryHandler(add_product_cb, pattern="add_product"))
     app.add_handler(CallbackQueryHandler(admin_products, pattern="admin_products"))
     app.add_handler(CallbackQueryHandler(edit_product, pattern="edit_"))
+    app.add_handler(CallbackQueryHandler(delete_product, pattern="delete_"))
     app.add_handler(CallbackQueryHandler(broadcast_cb, pattern="broadcast"))
 
     app.add_handler(CallbackQueryHandler(view_products, pattern="view_products"))
@@ -308,6 +370,7 @@ def main():
     app.add_handler(CallbackQueryHandler(view_cart, pattern="view_cart"))
     app.add_handler(CallbackQueryHandler(confirm_order, pattern="confirm_order"))
 
+    app.add_handler(MessageHandler(filters.PHOTO, handle_product_image))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, admin_text))
 
     app.run_polling()
