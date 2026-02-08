@@ -19,8 +19,18 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")
 ADMIN_ID = int(os.getenv("ADMIN_ID"))
 
 # ================== DB ==================
-conn = sqlite3.connect("shop.db", check_same_thread=False)
-cursor = conn.cursor()
+# Use writable directory for database (configurable via DATABASE_PATH env var)
+db_path = os.getenv("DATABASE_PATH", "/tmp/shop.db")
+
+try:
+    os.makedirs(os.path.dirname(db_path) or "/tmp", exist_ok=True)
+    conn = sqlite3.connect(db_path, check_same_thread=False)
+    cursor = conn.cursor()
+except (OSError, sqlite3.OperationalError):
+    # Fallback to /tmp if configured path is not writable
+    db_path = "/tmp/shop.db"
+    conn = sqlite3.connect(db_path, check_same_thread=False)
+    cursor = conn.cursor()
 
 cursor.execute("""
 CREATE TABLE IF NOT EXISTS users (
