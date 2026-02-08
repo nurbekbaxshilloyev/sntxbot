@@ -6,9 +6,6 @@ from datetime import datetime
 
 from dotenv import load_dotenv
 
-import matplotlib
-matplotlib.use("Agg")
-import matplotlib.pyplot as plt
 
 from telegram import (
     Update,
@@ -884,9 +881,16 @@ async def do_broadcast_photo(update: Update, context: ContextTypes.DEFAULT_TYPE,
             fail += 1
     await update.message.reply_text(f"📢 Broadcast (rasm) natija: ✅{ok} / ❌{fail}")
 
-# ----------------- Admin stats (graph) -----------------
+# ----------------- Admin stats (text) -----------------
+def make_bar(value: int, max_value: int, width: int = 18) -> str:
+    if max_value <= 0:
+        return "▱" * 1
+    filled = int((value / max_value) * width)
+    filled = max(1, min(width, filled))
+    return "▰" * filled + "▱" * (width - filled)
+
+
 async def send_stats(q, context: ContextTypes.DEFAULT_TYPE):
-    # basic stats
     cur.execute("SELECT COUNT(*) FROM users")
     users_count = int(cur.fetchone()[0])
 
@@ -895,12 +899,10 @@ async def send_stats(q, context: ContextTypes.DEFAULT_TYPE):
     orders_count = int(orders_count)
     revenue = int(revenue or 0)
 
-    # top products from orders.items_json
-    # (oddiy hisob: barcha buyurtmalardagi itemlarni parse qilib top)
     cur.execute("SELECT items_json FROM orders ORDER BY id DESC LIMIT 2000")
     rows = cur.fetchall()
 
-    counts = {}  # name -> qty
+    counts = {}
     for (items_json,) in rows:
         try:
             items = json.loads(items_json)
@@ -917,27 +919,20 @@ async def send_stats(q, context: ContextTypes.DEFAULT_TYPE):
         "📊 Statistika\n\n"
         f"👤 Foydalanuvchilar: {users_count}\n"
         f"🧾 Buyurtmalar: {orders_count}\n"
-        f"💰 Jami tushum: {money(revenue)} so'm\n"
+        f"💰 Jami tushum: {money(revenue)} so'm\n\n"
     )
-    await q.message.reply_text(text)
 
     if not top:
-        await q.message.reply_text("Grafik uchun yetarli buyurtma ma’lumoti yo‘q.")
+        text += "Grafik uchun hali buyurtmalar yetarli emas."
+        await q.message.reply_text(text)
         return
 
-    # create chart
-    names = [t[0] for t in top][::-1]
-    qtys = [t[1] for t in top][::-1]
+    max_qty = max(v for _, v in top)
+    text += "📈 Top mahsulotlar:\n"
+    for name, qty in top:
+        text += f"{make_bar(qty, max_qty)}  {qty}  — {name}\n"
 
-    plt.figure(figsize=(9, 5))
-    plt.barh(names, qtys)
-    plt.title("Top mahsulotlar (son bo‘yicha)")
-    plt.xlabel("Soni")
-    plt.tight_layout()
-    plt.savefig(CHART_PATH, dpi=160)
-    plt.close()
-
-    await q.message.reply_photo(photo=open(CHART_PATH, "rb"), caption="📈 Top mahsulotlar grafigi")
+    await q.message.reply_text(text)
 
 # ----------------- Admin edit state setters (text) -----------------
 async def admin_set_edit_state(update: Update, context: ContextTypes.DEFAULT_TYPE, state_name: str):
