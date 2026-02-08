@@ -24,10 +24,22 @@ ADMIN_ID = int(os.getenv("ADMIN_ID"))
 ADMIN_PHONE = os.getenv("ADMIN_PHONE")
 
 # ---------- DB ----------
-# Use absolute path for database to avoid file not found errors in production
-db_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "database.db")
-conn = sqlite3.connect(db_path, check_same_thread=False)
-cur = conn.cursor()
+# Use writable directory for database (configurable via DATABASE_PATH env var)
+# In production, this should point to a persistent volume, not read-only /nix/store
+db_path = os.getenv("DATABASE_PATH", "/tmp/telegram_bot_database.db")
+
+# Ensure directory exists and is writable
+db_dir = os.path.dirname(db_path) if os.path.dirname(db_path) else "/tmp"
+os.makedirs(db_dir, exist_ok=True)
+
+try:
+    conn = sqlite3.connect(db_path, check_same_thread=False)
+    cur = conn.cursor()
+except sqlite3.OperationalError as e:
+    # Fallback to /tmp if configured path is not writable
+    db_path = "/tmp/telegram_bot_database.db"
+    conn = sqlite3.connect(db_path, check_same_thread=False)
+    cur = conn.cursor()
 
 cur.execute("""
 CREATE TABLE IF NOT EXISTS users(
