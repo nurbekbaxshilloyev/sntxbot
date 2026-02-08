@@ -24,7 +24,9 @@ ADMIN_ID = int(os.getenv("ADMIN_ID"))
 ADMIN_PHONE = os.getenv("ADMIN_PHONE")
 
 # ---------- DB ----------
-conn = sqlite3.connect("database.db", check_same_thread=False)
+# Use absolute path for database to avoid file not found errors in production
+db_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "database.db")
+conn = sqlite3.connect(db_path, check_same_thread=False)
 cur = conn.cursor()
 
 cur.execute("""
