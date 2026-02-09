@@ -134,11 +134,31 @@ def cart_rows(user_id: int):
 def calc_cart_total(rows):
     return sum(int(r[4]) * int(r[2]) for r in rows)
 
+def ensure_nav(context: ContextTypes.DEFAULT_TYPE):
+    if "nav" not in context.user_data or not isinstance(context.user_data["nav"], list):
+        context.user_data["nav"] = []
+
+def nav_push(context: ContextTypes.DEFAULT_TYPE, view: str, data: dict | None = None):
+    ensure_nav(context)
+    context.user_data["nav"].append({"view": view, "data": data or {}})
+
+def nav_pop(context: ContextTypes.DEFAULT_TYPE):
+    ensure_nav(context)
+    if context.user_data["nav"]:
+        context.user_data["nav"].pop()
+
+def nav_top(context: ContextTypes.DEFAULT_TYPE):
+    ensure_nav(context)
+    if not context.user_data["nav"]:
+        return None
+    return context.user_data["nav"][-1]
+
 def clear_state(context: ContextTypes.DEFAULT_TYPE):
     keys = [
         "state",
         "tmp_name", "tmp_price", "tmp_has_sizes", "tmp_sizes",
-        "edit_pid", "edit_field",
+        "edit_pid",
+        "pending_pid", "pending_size", "pending_origin",
     ]
     for k in keys:
         context.user_data.pop(k, None)
@@ -169,12 +189,16 @@ def admin_panel_inline() -> InlineKeyboardMarkup:
         [InlineKeyboardButton("📊 Statistika", callback_data="A_STATS")],
     ])
 
+def back_btn() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Orqaga", callback_data="U_BACK")]])
+
 def back_to_admin_inline() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Admin panel", callback_data="A_HOME")]])
 
 # ----------------- States -----------------
 U_REG_NAME = "U_REG_NAME"
 U_REG_PHONE = "U_REG_PHONE"
+U_WAIT_QTY = "U_WAIT_QTY"  # size tanlangandan keyin son so'rash
 
 A_ADD_HAS_SIZES = "A_ADD_HAS_SIZES"
 A_ADD_NAME = "A_ADD_NAME"
@@ -264,6 +288,35 @@ async def menu_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Telefon raqamingizni yuboring:", reply_markup=contact_request_kb())
         return
 
+    # USER QTY FLOW (size tanlangandan keyin son so'raymiz)
+    if state == U_WAIT_QTY and (not is_admin(uid)):
+        qty_txt = text
+        if not qty_txt.isdigit():
+            await update.message.reply_text("❌ Son faqat raqam bo‘lishi kerak. Masalan: 3", reply_markup=back_btn())
+            return
+        qty = int(qty_txt)
+        if qty <= 0:
+            await update.message.reply_text("❌ Son 1 dan katta bo‘lsin.", reply_markup=back_btn())
+            return
+
+        pid = context.user_data.get("pending_pid")
+        size = context.user_data.get("pending_size", "-")
+        origin = context.user_data.get("pending_origin", "CATALOG")
+
+        if not pid:
+            clear_state(context)
+            await update.message.reply_text("⚠️ Xatolik. Qaytadan urinib ko‘ring.", reply_markup=main_menu_kb(False))
+            return
+
+        await cart_add_qty(uid, int(pid), size, qty)
+        clear_state(context)
+
+        await update.message.reply_text("✅ Savatchaga qo‘shildi.", reply_markup=main_menu_kb(False))
+
+        # foydalanuvchini oldingi oynaga qaytaramiz (talab bo'yicha back tugmasi ishlaydi)
+        # bu yerda avtomatik qaytarib yubormaymiz — user back bosib qaytadi.
+        return
+
     # ADMIN FLOWS
     if is_admin(uid):
         handled = await admin_text_flow(update, context)
@@ -272,18 +325,18 @@ async def menu_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # USER MENU
     if text == "🛍 Mahsulotlar":
-        await show_products_list(update)
+        await show_catalog_list(update, context, push=True)
         return
 
     if text == "🛒 Savatcha":
-        await show_cart_text(update, context)
+        await show_cart_list(update, context, push=True)
         return
 
     if text == "ℹ️ Info":
         await update.message.reply_text(
             "🏗 Qurilish materiallari buyurtma boti.\n"
             "🛍 Mahsulotlar — katalog\n"
-            "🛒 Savatcha — buyurtmani ko‘rish va tasdiqlash\n"
+            "🛒 Savatcha — buyurtma va tasdiqlash\n"
             "📞 Contact — aloqa"
         )
         return
@@ -298,161 +351,150 @@ async def menu_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await update.message.reply_text("Menyudan tanlang 👇", reply_markup=main_menu_kb(is_admin(uid)))
 
-# ----------------- Products (User) -----------------
-async def show_products_list(update: Update):
+# ----------------- Catalog list (1 post) -----------------
+async def show_catalog_list(update_or_qmsg, context: ContextTypes.DEFAULT_TYPE, push: bool):
     products = list_products()
     if not products:
-        await update.message.reply_text("Hozircha mahsulotlar yo‘q.")
+        if hasattr(update_or_qmsg, "message"):
+            await update_or_qmsg.message.reply_text("Hozircha mahsulotlar yo‘q.")
+        else:
+            await update_or_qmsg.reply_text("Hozircha mahsulotlar yo‘q.")
         return
 
+    if push:
+        nav_push(context, "CATALOG", {})
+
+    # 1 ta postda ro'yxat + inline tugmalar
+    lines = ["🛍 Mahsulotlar ro‘yxati:"]
+    kb = []
     for (pid, name, price, has_sizes, sizes, photo_id) in products:
-        caption = f"📦 {name}\n💰 {money(price)} so'm\n"
-        if has_sizes and sizes:
-            caption += f"📐 O‘lchamlar: {sizes}\n"
-        else:
-            caption += "📐 O‘lchamsiz\n"
-        caption += f"\n📞 Aloqa: {ADMIN_PHONE}"
+        lines.append(f"• {name}")
 
-        if has_sizes and sizes:
-            btns = []
-            for s in [x.strip() for x in sizes.split(",") if x.strip()]:
-                btns.append([InlineKeyboardButton(f"➕ {s}", callback_data=f"C_ADD|{pid}|{s}")])
-            btns.append([InlineKeyboardButton("🛒 Savatcha", callback_data="C_VIEW")])
-            markup = InlineKeyboardMarkup(btns)
-        else:
-            markup = InlineKeyboardMarkup([
-                [InlineKeyboardButton("➕ Savatchaga", callback_data=f"C_ADD|{pid}|-")],
-                [InlineKeyboardButton("🛒 Savatcha", callback_data="C_VIEW")]
-            ])
+        kb.append([InlineKeyboardButton(f"🔎 {name}", callback_data=f"U_PROD|{pid}|CATALOG")])
 
-        if photo_id:
-            await update.message.reply_photo(photo=photo_id, caption=caption, reply_markup=markup)
-        else:
-            await update.message.reply_text(caption, reply_markup=markup)
+    kb.append([InlineKeyboardButton("⬅️ Orqaga", callback_data="U_BACK")])
 
-# ----------------- Cart helpers -----------------
-async def cart_add(user_id: int, product_id: int, size: str):
-    size_val = None if size == "-" else size
-    cur.execute("""
-        SELECT qty FROM cart WHERE user_id=? AND product_id=? AND COALESCE(size,'-')=COALESCE(?, '-')
-    """, (user_id, product_id, size_val))
-    row = cur.fetchone()
-
-    if row:
-        cur.execute("""
-            UPDATE cart SET qty=qty+1
-            WHERE user_id=? AND product_id=? AND COALESCE(size,'-')=COALESCE(?, '-')
-        """, (user_id, product_id, size_val))
+    text = "\n".join(lines)
+    if hasattr(update_or_qmsg, "message"):
+        await update_or_qmsg.message.reply_text(text, reply_markup=InlineKeyboardMarkup(kb))
     else:
-        cur.execute("INSERT INTO cart(user_id,product_id,size,qty) VALUES (?,?,?,1)",
-                    (user_id, product_id, size_val))
-    conn.commit()
+        await update_or_qmsg.reply_text(text, reply_markup=InlineKeyboardMarkup(kb))
 
-async def cart_inc(user_id: int, product_id: int, size: str):
-    size_val = None if size == "-" else size
-    cur.execute("""
-        UPDATE cart SET qty=qty+1
-        WHERE user_id=? AND product_id=? AND COALESCE(size,'-')=COALESCE(?, '-')
-    """, (user_id, product_id, size_val))
-    conn.commit()
+# ----------------- Product detail -----------------
+async def show_product_detail(q_or_msg, context: ContextTypes.DEFAULT_TYPE, pid: int, origin: str, push: bool):
+    p = product_by_id(pid)
+    if not p:
+        if hasattr(q_or_msg, "message"):
+            await q_or_msg.message.reply_text("Mahsulot topilmadi.", reply_markup=back_btn())
+        else:
+            await q_or_msg.reply_text("Mahsulot topilmadi.", reply_markup=back_btn())
+        return
 
-async def cart_dec(user_id: int, product_id: int, size: str):
+    (pid, name, price, has_sizes, sizes, photo_id) = p
+
+    caption = f"📦 {name}\n💰 {money(price)} so'm\n"
+    if has_sizes and sizes:
+        caption += f"📐 O‘lchamlar: {sizes}\n"
+        caption += "\nO‘lchamni tanlang 👇 (keyin sonini kiritasiz)"
+    else:
+        caption += "📐 O‘lchamsiz\n\nSavatchaga qo‘shish uchun davom eting 👇 (keyin sonini kiritasiz)"
+
+    caption += f"\n\n📞 Aloqa: {ADMIN_PHONE}"
+
+    kb = []
+
+    if has_sizes and sizes:
+        for s in [x.strip() for x in sizes.split(",") if x.strip()]:
+            kb.append([InlineKeyboardButton(f"📐 {s}", callback_data=f"U_SIZE|{pid}|{s}|{origin}")])
+    else:
+        kb.append([InlineKeyboardButton("➕ Savatchaga", callback_data=f"U_SIZE|{pid}|-|{origin}")])
+
+    kb.append([InlineKeyboardButton("🛒 Savatcha", callback_data="U_CART")])
+    kb.append([InlineKeyboardButton("⬅️ Orqaga", callback_data="U_BACK")])
+
+    if push:
+        nav_push(context, "PRODUCT", {"pid": pid, "origin": origin})
+
+    if photo_id:
+        # yangi detail post
+        if hasattr(q_or_msg, "message"):
+            await q_or_msg.message.reply_photo(photo=photo_id, caption=caption, reply_markup=InlineKeyboardMarkup(kb))
+        else:
+            await q_or_msg.reply_photo(photo=photo_id, caption=caption, reply_markup=InlineKeyboardMarkup(kb))
+    else:
+        if hasattr(q_or_msg, "message"):
+            await q_or_msg.message.reply_text(caption, reply_markup=InlineKeyboardMarkup(kb))
+        else:
+            await q_or_msg.reply_text(caption, reply_markup=InlineKeyboardMarkup(kb))
+
+# ----------------- Cart: list (1 post) -----------------
+async def show_cart_list(update_or_qmsg, context: ContextTypes.DEFAULT_TYPE, push: bool):
+    uid = update_or_qmsg.from_user.id if hasattr(update_or_qmsg, "from_user") else update_or_qmsg.effective_user.id
+    rows = cart_rows(uid)
+    if not rows:
+        if hasattr(update_or_qmsg, "message"):
+            await update_or_qmsg.message.reply_text("🛒 Savatcha bo‘sh.", reply_markup=back_btn())
+        else:
+            await update_or_qmsg.reply_text("🛒 Savatcha bo‘sh.", reply_markup=back_btn())
+        return
+
+    if push:
+        nav_push(context, "CART", {})
+
+    total = calc_cart_total(rows)
+    lines = ["🛒 Savatcha ro‘yxati:"]
+    kb = []
+
+    for (pid, size, qty, name, price) in rows:
+        size_txt = f" ({size})" if size != "-" else ""
+        line_total = int(price) * int(qty)
+        lines.append(f"• {name}{size_txt} × {qty} = {money(line_total)} so'm")
+
+        # "linkli" tugma: bosilganda detal posti ochiladi
+        kb.append([InlineKeyboardButton(f"🔎 {name}{size_txt}", callback_data=f"U_PROD|{pid}|CART")])
+
+    lines.append(f"\n💰 Jami: {money(total)} so'm")
+
+    kb.append([InlineKeyboardButton("✅ Buyurtmani tasdiqlash", callback_data="U_CONFIRM")])
+    kb.append([InlineKeyboardButton("🧹 Savatchani tozalash", callback_data="U_CLEAR_CART")])
+    kb.append([InlineKeyboardButton("⬅️ Orqaga", callback_data="U_BACK")])
+
+    text = "\n".join(lines)
+    if hasattr(update_or_qmsg, "message"):
+        await update_or_qmsg.message.reply_text(text, reply_markup=InlineKeyboardMarkup(kb))
+    else:
+        await update_or_qmsg.reply_text(text, reply_markup=InlineKeyboardMarkup(kb))
+
+# ----------------- Cart DB operations (qty manual) -----------------
+async def cart_add_qty(user_id: int, product_id: int, size: str, qty_to_add: int):
     size_val = None if size == "-" else size
+
     cur.execute("""
         SELECT qty FROM cart
         WHERE user_id=? AND product_id=? AND COALESCE(size,'-')=COALESCE(?, '-')
     """, (user_id, product_id, size_val))
     row = cur.fetchone()
-    if not row:
-        return
-    qty = int(row[0])
-    if qty <= 1:
-        await cart_del(user_id, product_id, size)
-    else:
-        cur.execute("""
-            UPDATE cart SET qty=qty-1
-            WHERE user_id=? AND product_id=? AND COALESCE(size,'-')=COALESCE(?, '-')
-        """, (user_id, product_id, size_val))
-        conn.commit()
 
-async def cart_del(user_id: int, product_id: int, size: str):
-    size_val = None if size == "-" else size
-    cur.execute("""
-        DELETE FROM cart
-        WHERE user_id=? AND product_id=? AND COALESCE(size,'-')=COALESCE(?, '-')
-    """, (user_id, product_id, size_val))
+    if row:
+        cur.execute("""
+            UPDATE cart SET qty=qty+?
+            WHERE user_id=? AND product_id=? AND COALESCE(size,'-')=COALESCE(?, '-')
+        """, (qty_to_add, user_id, product_id, size_val))
+    else:
+        cur.execute("INSERT INTO cart(user_id,product_id,size,qty) VALUES (?,?,?,?)",
+                    (user_id, product_id, size_val, qty_to_add))
     conn.commit()
 
-# ----------------- Cart UI -----------------
-async def show_cart_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    uid = update.effective_user.id
-    rows = cart_rows(uid)
-    if not rows:
-        await update.message.reply_text("🛒 Savatcha bo‘sh.")
-        return
-
-    total = calc_cart_total(rows)
-    lines = ["🛒 Savatcha:"]
-    keyboard = []
-
-    for (pid, size, qty, name, price) in rows:
-        size_txt = f" ({size})" if size != "-" else ""
-        lines.append(f"• {name}{size_txt} × {qty} = {money(price*qty)} so'm")
-
-        keyboard.append([
-            InlineKeyboardButton("➖", callback_data=f"C_DEC|{pid}|{size}"),
-            InlineKeyboardButton(f"{qty} dona", callback_data="noop"),
-            InlineKeyboardButton("➕", callback_data=f"C_INC|{pid}|{size}"),
-        ])
-        keyboard.append([InlineKeyboardButton("🗑 O‘chirish", callback_data=f"C_DEL|{pid}|{size}")])
-
-    lines.append(f"\n💰 Jami: {money(total)} so'm")
-
-    keyboard.append([InlineKeyboardButton("✅ Buyurtmani tasdiqlash", callback_data="C_CONFIRM")])
-    keyboard.append([InlineKeyboardButton("🧹 Savatchani tozalash", callback_data="C_CLEAR")])
-
-    await update.message.reply_text("\n".join(lines), reply_markup=InlineKeyboardMarkup(keyboard))
-
-async def show_cart_from_callback(q, context: ContextTypes.DEFAULT_TYPE):
-    uid = q.from_user.id
-    rows = cart_rows(uid)
-    if not rows:
-        await q.message.reply_text("🛒 Savatcha bo‘sh.")
-        return
-
-    total = calc_cart_total(rows)
-    lines = ["🛒 Savatcha:"]
-    keyboard = []
-
-    for (pid, size, qty, name, price) in rows:
-        size_txt = f" ({size})" if size != "-" else ""
-        lines.append(f"• {name}{size_txt} × {qty} = {money(price*qty)} so'm")
-
-        keyboard.append([
-            InlineKeyboardButton("➖", callback_data=f"C_DEC|{pid}|{size}"),
-            InlineKeyboardButton(f"{qty} dona", callback_data="noop"),
-            InlineKeyboardButton("➕", callback_data=f"C_INC|{pid}|{size}"),
-        ])
-        keyboard.append([InlineKeyboardButton("🗑 O‘chirish", callback_data=f"C_DEL|{pid}|{size}")])
-
-    lines.append(f"\n💰 Jami: {money(total)} so'm")
-
-    keyboard.append([InlineKeyboardButton("✅ Buyurtmani tasdiqlash", callback_data="C_CONFIRM")])
-    keyboard.append([InlineKeyboardButton("🧹 Savatchani tozalash", callback_data="C_CLEAR")])
-
-    await q.message.reply_text("\n".join(lines), reply_markup=InlineKeyboardMarkup(keyboard))
-
 # ----------------- Order confirm -----------------
-async def confirm_order(q, context: ContextTypes.DEFAULT_TYPE):
-    uid = q.from_user.id
-    user = get_user(uid)
+async def confirm_order(user_id: int, context: ContextTypes.DEFAULT_TYPE, reply_target):
+    user = get_user(user_id)
     if not user:
-        await q.message.reply_text("❗ Avval /start qilib ro‘yxatdan o‘ting.")
+        await reply_target.reply_text("❗ Avval /start qilib ro‘yxatdan o‘ting.", reply_markup=back_btn())
         return
 
-    rows = cart_rows(uid)
+    rows = cart_rows(user_id)
     if not rows:
-        await q.message.reply_text("🛒 Savatcha bo‘sh.")
+        await reply_target.reply_text("🛒 Savatcha bo‘sh.", reply_markup=back_btn())
         return
 
     total = calc_cart_total(rows)
@@ -468,12 +510,12 @@ async def confirm_order(q, context: ContextTypes.DEFAULT_TYPE):
     now = datetime.utcnow().isoformat()
     cur.execute(
         "INSERT INTO orders(user_id, items_json, total, created_at) VALUES (?,?,?,?)",
-        (uid, json.dumps(items, ensure_ascii=False), int(total), now)
+        (user_id, json.dumps(items, ensure_ascii=False), int(total), now)
     )
-    cur.execute("DELETE FROM cart WHERE user_id=?", (uid,))
+    cur.execute("DELETE FROM cart WHERE user_id=?", (user_id,))
     conn.commit()
 
-    await q.message.reply_text("✅ Buyurtma qabul qilindi! Tez orada siz bilan bog‘lanamiz.")
+    await reply_target.reply_text("✅ Buyurtma qabul qilindi! Tez orada siz bilan bog‘lanamiz.", reply_markup=back_btn())
 
     name, phone = user
     admin_text = (
@@ -484,7 +526,6 @@ async def confirm_order(q, context: ContextTypes.DEFAULT_TYPE):
         f"💰 Jami: {money(total)} so'm"
     )
 
-    # ✅ 2 adminning ikkalasiga yuboriladi
     for aid in ADMIN_IDS:
         try:
             await context.bot.send_message(chat_id=aid, text=admin_text)
@@ -504,10 +545,11 @@ async def admin_manage_products(q, context: ContextTypes.DEFAULT_TYPE):
         markup = InlineKeyboardMarkup([
             [InlineKeyboardButton("✏️ Tahrirlash", callback_data=f"A_EDIT|{pid}")],
             [InlineKeyboardButton("❌ O‘chirish", callback_data=f"A_DEL_DO|{pid}")],
+            [InlineKeyboardButton("⬅️ Admin panel", callback_data="A_HOME")]
         ])
         await q.message.reply_text(text, reply_markup=markup)
 
-# ----------------- Admin stats (deploy safe text chart) -----------------
+# ----------------- Admin stats (text chart) -----------------
 def make_bar(value: int, max_value: int, width: int = 18) -> str:
     if max_value <= 0:
         return "▰"
@@ -549,7 +591,7 @@ async def send_stats(q, context: ContextTypes.DEFAULT_TYPE):
 
     if not top:
         text += "Grafik uchun hali buyurtmalar yetarli emas."
-        await q.message.reply_text(text)
+        await q.message.reply_text(text, reply_markup=back_to_admin_inline())
         return
 
     max_qty = max(v for _, v in top)
@@ -557,7 +599,7 @@ async def send_stats(q, context: ContextTypes.DEFAULT_TYPE):
     for name, qty in top:
         text += f"{make_bar(qty, max_qty)}  {qty}  — {name}\n"
 
-    await q.message.reply_text(text)
+    await q.message.reply_text(text, reply_markup=back_to_admin_inline())
 
 # ----------------- Admin flows (text/photo/broadcast/edit) -----------------
 async def admin_text_flow(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
@@ -571,25 +613,25 @@ async def admin_text_flow(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     # ADD PRODUCT
     if state == A_ADD_NAME:
         if len(text) < 2:
-            await update.message.reply_text("Nom juda qisqa. Qayta kiriting:")
+            await update.message.reply_text("Nom juda qisqa. Qayta kiriting:", reply_markup=back_to_admin_inline())
             return True
         context.user_data["tmp_name"] = text
         context.user_data["state"] = A_ADD_PRICE
-        await update.message.reply_text("💰 Narxni kiriting (faqat son):")
+        await update.message.reply_text("💰 Narxni kiriting (faqat son):", reply_markup=back_to_admin_inline())
         return True
 
     if state == A_ADD_PRICE:
         if not text.isdigit():
-            await update.message.reply_text("❌ Narx faqat raqam bo‘lishi kerak. Masalan: 120000")
+            await update.message.reply_text("❌ Narx faqat raqam bo‘lsin. Masalan: 120000", reply_markup=back_to_admin_inline())
             return True
         context.user_data["tmp_price"] = int(text)
         has_sizes = int(context.user_data.get("tmp_has_sizes", 0))
         if has_sizes == 1:
             context.user_data["state"] = A_ADD_SIZES
-            await update.message.reply_text("📐 O‘lchamlarni kiriting (vergul bilan). Masalan: 10x10, 20x20")
+            await update.message.reply_text("📐 O‘lchamlarni kiriting (vergul bilan). Masalan: 10x10, 20x20", reply_markup=back_to_admin_inline())
         else:
             context.user_data["state"] = A_ADD_PHOTO
-            await update.message.reply_text("🖼 Mahsulot rasmini yuboring (photo):")
+            await update.message.reply_text("🖼 Mahsulot rasmini yuboring (photo):", reply_markup=back_to_admin_inline())
         return True
 
     if state == A_ADD_SIZES:
@@ -600,7 +642,7 @@ async def admin_text_flow(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         else:
             context.user_data["tmp_sizes"] = sizes
         context.user_data["state"] = A_ADD_PHOTO
-        await update.message.reply_text("🖼 Mahsulot rasmini yuboring (photo):")
+        await update.message.reply_text("🖼 Mahsulot rasmini yuboring (photo):", reply_markup=back_to_admin_inline())
         return True
 
     # EDIT FIELDS (text)
@@ -623,7 +665,7 @@ async def admin_text_flow(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             clear_state(context)
             return True
         if not text.isdigit():
-            await update.message.reply_text("❌ Narx faqat son bo‘lishi kerak.")
+            await update.message.reply_text("❌ Narx faqat son bo‘lishi kerak.", reply_markup=back_to_admin_inline())
             return True
         cur.execute("UPDATE products SET price=? WHERE id=?", (int(text), pid))
         conn.commit()
@@ -703,7 +745,7 @@ async def admin_photo_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
         await update.message.reply_text("✅ Rasm yangilandi.", reply_markup=back_to_admin_inline())
         return
 
-    # BROADCAST PHOTO (admin rasm yuborsa)
+    # BROADCAST PHOTO
     if state == A_BC_TEXT:
         cap = update.message.caption or ""
         await do_broadcast_photo(update, context, update.message.photo[-1].file_id, cap)
@@ -721,7 +763,7 @@ async def do_broadcast_text(update: Update, context: ContextTypes.DEFAULT_TYPE, 
             ok += 1
         except Exception:
             fail += 1
-    await update.message.reply_text(f"📢 Broadcast natija: ✅{ok} / ❌{fail}")
+    await update.message.reply_text(f"📢 Broadcast natija: ✅{ok} / ❌{fail}", reply_markup=back_to_admin_inline())
 
 async def do_broadcast_photo(update: Update, context: ContextTypes.DEFAULT_TYPE, file_id: str, caption: str):
     cur.execute("SELECT user_id FROM users")
@@ -733,7 +775,7 @@ async def do_broadcast_photo(update: Update, context: ContextTypes.DEFAULT_TYPE,
             ok += 1
         except Exception:
             fail += 1
-    await update.message.reply_text(f"📢 Broadcast (rasm) natija: ✅{ok} / ❌{fail}")
+    await update.message.reply_text(f"📢 Broadcast (rasm) natija: ✅{ok} / ❌{fail}", reply_markup=back_to_admin_inline())
 
 # ----------------- Callbacks -----------------
 async def cb_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -758,7 +800,7 @@ async def cb_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
             markup = InlineKeyboardMarkup([
                 [InlineKeyboardButton("📐 O‘lchamli", callback_data="A_ADD_SZ|1")],
                 [InlineKeyboardButton("📦 O‘lchamsiz", callback_data="A_ADD_SZ|0")],
-                [InlineKeyboardButton("❌ Bekor", callback_data="A_HOME")],
+                [InlineKeyboardButton("⬅️ Admin panel", callback_data="A_HOME")],
             ])
             await q.message.reply_text("Mahsulot o‘lchamlimi?", reply_markup=markup)
             return
@@ -783,7 +825,8 @@ async def cb_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 [InlineKeyboardButton("💰 Narx", callback_data="A_EF|price")],
                 [InlineKeyboardButton("📐 O‘lchamlar", callback_data="A_EF|sizes")],
                 [InlineKeyboardButton("🖼 Rasm", callback_data="A_EF|photo")],
-                [InlineKeyboardButton("⬅️ Orqaga", callback_data="A_MANAGE")]
+                [InlineKeyboardButton("❌ O‘chirish", callback_data=f"A_DEL_DO|{pid}")],
+                [InlineKeyboardButton("⬅️ Orqaga", callback_data="A_MANAGE")],
             ])
             await q.message.reply_text("Nimani tahrirlaysiz?", reply_markup=markup)
             return
@@ -797,22 +840,22 @@ async def cb_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
             if field == "name":
                 context.user_data["state"] = A_EDIT_NAME
-                await q.message.reply_text("✏️ Yangi nomini kiriting:")
+                await q.message.reply_text("✏️ Yangi nomini kiriting:", reply_markup=back_to_admin_inline())
                 return
 
             if field == "price":
                 context.user_data["state"] = A_EDIT_PRICE
-                await q.message.reply_text("💰 Yangi narxni kiriting (faqat son):")
+                await q.message.reply_text("💰 Yangi narxni kiriting (faqat son):", reply_markup=back_to_admin_inline())
                 return
 
             if field == "sizes":
                 context.user_data["state"] = A_EDIT_SIZES
-                await q.message.reply_text("📐 O‘lchamlarni kiriting (vergul bilan). O‘lchamsiz qilish uchun: -")
+                await q.message.reply_text("📐 O‘lchamlarni kiriting (vergul bilan). O‘lchamsiz qilish uchun: -", reply_markup=back_to_admin_inline())
                 return
 
             if field == "photo":
                 context.user_data["state"] = A_EDIT_PHOTO
-                await q.message.reply_text("🖼 Yangi rasm yuboring (photo):")
+                await q.message.reply_text("🖼 Yangi rasm yuboring (photo):", reply_markup=back_to_admin_inline())
                 return
 
         if data.startswith("A_DEL_DO|"):
@@ -821,8 +864,7 @@ async def cb_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
             cur.execute("DELETE FROM cart WHERE product_id=?", (pid,))
             conn.commit()
             clear_state(context)
-            await q.message.reply_text("✅ Mahsulot o‘chirildi.")
-            await admin_manage_products(q, context)
+            await q.message.reply_text("✅ Mahsulot o‘chirildi.", reply_markup=back_to_admin_inline())
             return
 
         if data == "A_BC":
@@ -835,49 +877,109 @@ async def cb_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await send_stats(q, context)
             return
 
-        await q.message.reply_text("⚠️ Noma'lum admin buyruq.", reply_markup=back_to_admin_inline())
         return
 
-    # ---------- USER / CART ----------
-    if data == "C_VIEW":
-        await show_cart_from_callback(q, context)
+    # ---------- USER ----------
+    if data == "U_CART":
+        await show_cart_list(q, context, push=True)
         return
 
-    if data.startswith("C_ADD|"):
-        _, pid, size = data.split("|")
-        await cart_add(uid, int(pid), size)
-        await q.message.reply_text("✅ Savatchaga qo‘shildi.")
+    if data == "U_BACK":
+        await handle_user_back(q, context)
         return
 
-    if data.startswith("C_INC|"):
-        _, pid, size = data.split("|")
-        await cart_inc(uid, int(pid), size)
-        await show_cart_from_callback(q, context)
+    if data.startswith("U_PROD|"):
+        # U_PROD|pid|ORIGIN
+        parts = data.split("|", 2)
+        pid = int(parts[1])
+        origin = parts[2] if len(parts) > 2 else "CATALOG"
+        await show_product_detail(q, context, pid, origin=origin, push=True)
         return
 
-    if data.startswith("C_DEC|"):
-        _, pid, size = data.split("|")
-        await cart_dec(uid, int(pid), size)
-        await show_cart_from_callback(q, context)
+    if data.startswith("U_SIZE|"):
+        # U_SIZE|pid|size|origin -> tanlagandan keyin son so'raymiz
+        _, pid, size, origin = data.split("|", 3)
+        pid = int(pid)
+        context.user_data["pending_pid"] = pid
+        context.user_data["pending_size"] = size
+        context.user_data["pending_origin"] = origin
+        context.user_data["state"] = U_WAIT_QTY
+
+        # nav: qty oynasi ham view sifatida kiritamiz (back ishlashi uchun)
+        nav_push(context, "QTY", {"pid": pid, "origin": origin})
+
+        await q.message.reply_text(
+            "🔢 Nechta dona kerak? Sonini yozib yuboring (masalan: 3)",
+            reply_markup=back_btn()
+        )
         return
 
-    if data.startswith("C_DEL|"):
-        _, pid, size = data.split("|")
-        await cart_del(uid, int(pid), size)
-        await show_cart_from_callback(q, context)
-        return
-
-    if data == "C_CLEAR":
+    if data == "U_CLEAR_CART":
         cur.execute("DELETE FROM cart WHERE user_id=?", (uid,))
         conn.commit()
-        await q.message.reply_text("🧹 Savatcha tozalandi.")
+        await q.message.reply_text("🧹 Savatcha tozalandi.", reply_markup=back_btn())
         return
 
-    if data == "C_CONFIRM":
-        await confirm_order(q, context)
+    if data == "U_CONFIRM":
+        await confirm_order(uid, context, q.message)
         return
 
-    await q.message.reply_text("⚠️ Noma'lum buyruq.")
+# ----------------- User BACK handler -----------------
+async def handle_user_back(q, context: ContextTypes.DEFAULT_TYPE):
+    # current view ni olib tashlaymiz, keyingisini ko'rsatamiz
+    # agar bo'sh qolsa — main menu ga qaytamiz
+    nav_pop(context)
+    top = nav_top(context)
+
+    if not top:
+        # main menu
+        await q.message.reply_text("🏠 Bosh menyu", reply_markup=main_menu_kb(is_admin(q.from_user.id)))
+        return
+
+    view = top["view"]
+    data = top.get("data", {})
+
+    if view == "CATALOG":
+        # push=False, chunki back orqali qaytyapmiz
+        await show_catalog_list(q.message, context, push=False)
+        return
+
+    if view == "CART":
+        await show_cart_list(q.message, context, push=False)
+        return
+
+    if view == "PRODUCT":
+        pid = int(data.get("pid", 0))
+        origin = data.get("origin", "CATALOG")
+        await show_product_detail(q.message, context, pid, origin=origin, push=False)
+        return
+
+    if view == "QTY":
+        # qty view dan back bosilsa — origin ga qaytadi
+        origin = data.get("origin", "CATALOG")
+        clear_state(context)
+        # QTY view ni olib tashlash uchun nav_pop allaqachon bo'ldi, endi top qayta render qiladi.
+        # shu yerda hech narsa qilmaymiz, yana bir back bosmaslik uchun:
+        # Nav stackda QTY dan oldingi view qolgan bo'ladi, uni render qilamiz:
+        top2 = nav_top(context)
+        if not top2:
+            await q.message.reply_text("🏠 Bosh menyu", reply_markup=main_menu_kb(False))
+            return
+        # top2 ni render:
+        if top2["view"] == "CATALOG":
+            await show_catalog_list(q.message, context, push=False)
+        elif top2["view"] == "CART":
+            await show_cart_list(q.message, context, push=False)
+        elif top2["view"] == "PRODUCT":
+            pid2 = int(top2["data"].get("pid", 0))
+            origin2 = top2["data"].get("origin", "CATALOG")
+            await show_product_detail(q.message, context, pid2, origin=origin2, push=False)
+        else:
+            await q.message.reply_text("🏠 Bosh menyu", reply_markup=main_menu_kb(False))
+        return
+
+    # fallback
+    await q.message.reply_text("🏠 Bosh menyu", reply_markup=main_menu_kb(False))
 
 # ----------------- Main -----------------
 def main():
@@ -888,13 +990,8 @@ def main():
 
     app.add_handler(CallbackQueryHandler(cb_router))
 
-    # Registration contact (only once for new users)
     app.add_handler(MessageHandler(filters.CONTACT, contact_handler))
-
-    # Admin photo flows (add/edit/broadcast)
     app.add_handler(MessageHandler(filters.PHOTO, admin_photo_handler))
-
-    # Text: user menu + admin flows
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, menu_handler))
 
     log.info("Bot running. DB at %s | Admins: %s", DB_PATH, ADMIN_IDS)
